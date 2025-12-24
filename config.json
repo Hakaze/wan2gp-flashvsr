@@ -1,0 +1,148 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "FlashVSR Plugin Configuration",
+  "description": "Configuration file for FlashVSR video upscaling plugin",
+  "type": "object",
+  "properties": {
+    "model_variant": {
+      "type": "string",
+      "enum": [
+        "tiny",
+        "tiny-long",
+        "full"
+      ],
+      "default": "tiny",
+      "description": "Default FlashVSR model variant to use. Tiny (8-10GB), Tiny-Long (10-12GB), Full (18-24GB)"
+    },
+    "scale_factor": {
+      "type": "integer",
+      "enum": [
+        2,
+        4
+      ],
+      "default": 4,
+      "description": "Default upscaling factor. 4x is native FlashVSR resolution"
+    },
+    "vram_optimization": {
+      "type": "object",
+      "properties": {
+        "tiled_vae": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable tiled VAE processing for high resolution outputs (>1080p)"
+        },
+        "tiled_dit": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable tiled DiT processing for low VRAM GPUs (required for 8GB at 1080p)"
+        },
+        "tile_size": {
+          "type": "integer",
+          "minimum": 128,
+          "maximum": 512,
+          "default": 256,
+          "description": "Size of each tile in pixels. Smaller = less VRAM but slower processing"
+        },
+        "overlap": {
+          "type": "integer",
+          "minimum": 8,
+          "maximum": 64,
+          "default": 24,
+          "description": "Overlap between adjacent tiles in pixels to reduce seam artifacts"
+        }
+      }
+    },
+    "quality_settings": {
+      "type": "object",
+      "properties": {
+        "color_fix": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable wavelet-based color correction to preserve original color grading"
+        },
+        "output_quality": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "default": 6,
+          "description": "Output video quality (1-10)"
+        },
+        "output_fps": {
+          "type": "number",
+          "default": 30,
+          "description": "Output FPS for image sequence input"
+        }
+      }
+    },
+    "sparse_attention": {
+      "type": "object",
+      "properties": {
+        "sparse_ratio": {
+          "type": "number",
+          "minimum": 0.5,
+          "maximum": 5.0,
+          "default": 2.0,
+          "description": "Sparse attention ratio. Higher = more accurate but slower"
+        },
+        "kv_ratio": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8,
+          "default": 3,
+          "description": "Key-value cache ratio for sparse attention"
+        },
+        "local_range": {
+          "type": "integer",
+          "minimum": 3,
+          "maximum": 15,
+          "default": 11,
+          "description": "Local attention range"
+        }
+      }
+    },
+    "processing": {
+      "type": "object",
+      "properties": {
+        "dtype": {
+          "type": "string",
+          "enum": [
+            "fp16",
+            "bf16"
+          ],
+          "default": "bf16",
+          "description": "Data type for model inference"
+        },
+        "unload_dit": {
+          "type": "boolean",
+          "default": true,
+          "description": "Unload DiT before decoding to save VRAM"
+        }
+      }
+    }
+  },
+  "default": {
+    "model_variant": "tiny",
+    "model_version": "FlashVSR-v1.1",
+    "scale_factor": 2,
+    "vram_optimization": {
+      "tiled_vae": true,
+      "tiled_dit": true,
+      "tile_size": 256,
+      "overlap": 24
+    },
+    "quality_settings": {
+      "color_fix": true,
+      "output_quality": 6,
+      "output_fps": 30
+    },
+    "sparse_attention": {
+      "sparse_ratio": 2.0,
+      "kv_ratio": 3,
+      "local_range": 11
+    },
+    "processing": {
+      "dtype": "bf16",
+      "unload_dit": true
+    }
+  }
+}

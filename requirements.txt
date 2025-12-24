@@ -1,0 +1,26 @@
+# Core dependencies (most already in Wan2GP)
+# torch>=2.0.0
+# transformers>=4.40.0
+# accelerate>=0.20.0
+# einops
+# opencv-python>=4.8.0
+# imageio>=2.31.0
+# imageio-ffmpeg>=0.4.9
+# gradio>=5.29.0
+# tqdm>=4.65.0
+# ffmpeg-python
+
+safetensors>=0.4.0
+
+# DiffSynth Studio framework
+diffsynth>=0.1.0
+
+# Video processing (already in Wan2GP)
+pillow>=10.0.0
+
+# Triton for Sage attention (usually comes with PyTorch)
+triton; platform_system!="Windows"
+triton-windows; platform_system=="Windows"
+
+# HuggingFace hub for model downloads
+huggingface_hub>=0.16.0
