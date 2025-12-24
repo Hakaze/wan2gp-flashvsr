@@ -447,7 +447,7 @@ class FlashVSRPlugin(WAN2GPPlugin):
         """
         super().__init__()
         self.name = "FlashVSR Upscaling"
-        self.version = "2.0.0"
+        self.version = "1.0.0"
         self.description = "AI-powered 4x video upscaling with FlashVSR models (8GB+ VRAM)"
         
         # Plugin state
