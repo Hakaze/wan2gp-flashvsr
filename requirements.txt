@@ -24,3 +24,6 @@ triton-windows; platform_system=="Windows"
 
 # HuggingFace hub for model downloads
 huggingface_hub>=0.16.0
+
+# System memory querying for pre-flight resource checks
+psutil>=5.9.0

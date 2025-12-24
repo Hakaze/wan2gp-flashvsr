@@ -5,6 +5,40 @@ All notable changes to the FlashVSR Plugin for Wan2GP will be documented in this
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2025-12-23
+
+### Added
+
+- **Pre-Flight Resource Check** - Estimates VRAM/RAM requirements before processing starts
+  - Uses SAFETY_FACTOR of 4.0 for accurate estimation (based on ComfyUI-FlashVSR_Stable)
+  - Displays warnings with recommended settings when resources are insufficient
+  - Logs processing summary with peak VRAM usage on completion
+- **Cancellation Support** - Stop button to cancel long-running upscaling operations
+  - Two-button pattern: Upscale button hides, Stop button appears during processing
+  - Graceful cancellation with cleanup of partial files
+  - Note: Cannot interrupt mid-inference; stops between operations
+- **Adaptive Batch Sizing** - Dynamically calculates safe batch sizes based on available RAM
+  - Queries system RAM at runtime using `psutil`
+  - Prevents memory exhaustion during video output phase
+
+### Changed
+
+- **Memory-Efficient Video Output** - Streaming frame writer replaces batch-to-numpy conversion
+  - Eliminates 10-15GB+ RAM spike during 4K output
+  - Progressive cleanup of intermediate tensors
+- **Improved Tiled DiT Guidance** - UI now recommends Tiled DiT for 50+ frame videos
+  - Updated info text explaining O(n²) complexity without tiling
+  - Pre-flight warns when >100 frames without Tiled DiT enabled
+- **Status Feedback** - Replaced status textbox with Gradio toast notifications
+  - `gr.Info` for success messages
+  - `gr.Warning` for warnings and recommendations  
+  - `gr.Error` for error messages
+
+### Fixed
+
+- **Memory Exhaustion on 4x Upscale** - 100+ frame 4K videos no longer cause system lockups
+- **No Way to Cancel** - Users can now stop processing (between operations)
+
 ## [1.0.0] - 2025-12-23
 
 ### Added

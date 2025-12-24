@@ -127,7 +127,7 @@
     "vram_optimization": {
       "tiled_vae": true,
       "tiled_dit": true,
-      "tile_size": 256,
+      "tile_size": 512,
       "overlap": 24
     },
     "quality_settings": {
@@ -143,6 +143,9 @@
     "processing": {
       "dtype": "bf16",
       "unload_dit": true
+    },
+    "debug": {
+      "memory_logging": false
     }
   }
 }

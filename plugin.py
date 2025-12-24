@@ -215,6 +215,351 @@ def clean_vram():
         torch.cuda.empty_cache()
 
 
+# =============================================================================
+# PRE-FLIGHT RESOURCE CHECK FUNCTIONS
+# =============================================================================
+
+# Safety factor to account for intermediate activations, VAE overhead, and CUDA workspace
+# Based on ComfyUI-FlashVSR_Stable reference implementation
+VRAM_SAFETY_FACTOR = 4.0
+
+# OOM threshold - warn if predicted usage exceeds this percentage of available VRAM
+OOM_THRESHOLD = 0.95
+
+
+def estimate_vram_usage(width, height, frames, scale, tiled_vae, tiled_dit, mode="tiny"):
+    """
+    Estimate VRAM usage for FlashVSR upscaling operation.
+    
+    Based on ComfyUI-FlashVSR_Stable reference which uses SAFETY_FACTOR = 4.0
+    to account for intermediate activations, VAE overhead, and CUDA workspace.
+    
+    Args:
+        width: Input video width
+        height: Input video height
+        frames: Number of frames
+        scale: Scale factor (2 or 4)
+        tiled_vae: Whether tiled VAE is enabled
+        tiled_dit: Whether tiled DiT is enabled
+        mode: Pipeline variant ("tiny", "tiny-long", "full")
+        
+    Returns:
+        dict with:
+            - model_vram_gb: Base model VRAM requirements
+            - inference_vram_gb: Estimated inference VRAM with safety factor
+            - output_ram_gb: Estimated system RAM for output phase
+            - total_vram_gb: Total estimated VRAM needed
+            - details: Human-readable breakdown string
+    """
+    # Output dimensions
+    out_width = width * scale
+    out_height = height * scale
+    
+    # Base model sizes (approximate, from HuggingFace model cards)
+    model_sizes = {
+        "tiny": 2.5,      # TCDecoder + DiT in bf16
+        "tiny-long": 2.5, # Same as tiny but with streaming
+        "full": 4.0       # Full VAE decoder
+    }
+    base_model_gb = model_sizes.get(mode, 2.5)
+    
+    # Per-frame tensor size at output resolution (bf16 = 2 bytes per element)
+    # Shape: (C=3, H, W) per frame
+    bytes_per_frame_bf16 = 3 * out_height * out_width * 2  # bf16
+    bytes_per_frame_fp32 = 3 * out_height * out_width * 4  # fp32 for intermediate
+    
+    # DiT processing memory - varies based on tiling
+    if tiled_dit:
+        # Tiled: process one tile at a time, much lower peak
+        tile_size = 256  # Default tile size
+        effective_pixels = tile_size * tile_size * scale * scale
+        dit_memory_gb = (effective_pixels * 3 * 2 * VRAM_SAFETY_FACTOR) / (1024**3)
+    else:
+        # Full frame: need to hold entire frame in memory
+        dit_memory_gb = (out_width * out_height * 3 * 2 * VRAM_SAFETY_FACTOR) / (1024**3)
+    
+    # VAE decoding memory
+    if tiled_vae:
+        # Tiled VAE: lower peak memory
+        vae_memory_gb = 1.0
+    else:
+        # Full VAE: scales with output size
+        vae_memory_gb = (out_width * out_height * 3 * 4) / (1024**3) * 2  # fp32 with overhead
+    
+    # Inference VRAM = model + dit processing + vae
+    inference_vram_gb = base_model_gb + dit_memory_gb + vae_memory_gb
+    
+    # Output phase RAM estimation (for non-streaming modes)
+    # Need to hold all frames as float32 for processing, then uint8 for output
+    if mode == "tiny-long":
+        # Streaming mode: minimal RAM overhead
+        output_ram_gb = bytes_per_frame_fp32 * 2 / (1024**3)  # ~2 frames buffer
+    else:
+        # Batch mode: need all frames in memory
+        # float32 tensor + numpy uint8 copy
+        output_ram_gb = (frames * bytes_per_frame_fp32 + frames * bytes_per_frame_bf16) / (1024**3)
+    
+    total_vram_gb = inference_vram_gb
+    
+    # Build details string
+    details = (
+        f"Model: {base_model_gb:.1f}GB, "
+        f"DiT: {dit_memory_gb:.1f}GB{'(tiled)' if tiled_dit else ''}, "
+        f"VAE: {vae_memory_gb:.1f}GB{'(tiled)' if tiled_vae else ''}, "
+        f"Output RAM: {output_ram_gb:.1f}GB"
+    )
+    
+    return {
+        "model_vram_gb": base_model_gb,
+        "inference_vram_gb": inference_vram_gb,
+        "output_ram_gb": output_ram_gb,
+        "total_vram_gb": total_vram_gb,
+        "details": details
+    }
+
+
+def check_resources(estimated_vram_gb, estimated_ram_gb):
+    """
+    Compare estimated resource requirements against available system resources.
+    
+    Args:
+        estimated_vram_gb: Estimated VRAM needed in GB
+        estimated_ram_gb: Estimated system RAM needed in GB
+        
+    Returns:
+        dict with:
+            - vram_ok: Boolean, True if sufficient VRAM
+            - ram_ok: Boolean, True if sufficient RAM
+            - available_vram_gb: Available VRAM in GB
+            - available_ram_gb: Available system RAM in GB
+            - vram_headroom_gb: VRAM headroom (negative = shortage)
+            - ram_headroom_gb: RAM headroom (negative = shortage)
+            - warnings: List of warning messages
+    """
+    import psutil
+    
+    warnings = []
+    
+    # Check VRAM
+    available_vram_gb = 0.0
+    total_vram_gb = 0.0
+    if torch.cuda.is_available():
+        try:
+            free_vram, total_vram = torch.cuda.mem_get_info()
+            available_vram_gb = free_vram / (1024**3)
+            total_vram_gb = total_vram / (1024**3)
+        except Exception:
+            # Fallback: estimate from allocated
+            total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            allocated = torch.cuda.memory_allocated() / (1024**3)
+            available_vram_gb = total_vram_gb - allocated
+    
+    # Check system RAM
+    mem = psutil.virtual_memory()
+    available_ram_gb = mem.available / (1024**3)
+    total_ram_gb = mem.total / (1024**3)
+    
+    # Calculate headroom
+    vram_headroom_gb = available_vram_gb - estimated_vram_gb
+    ram_headroom_gb = available_ram_gb - estimated_ram_gb
+    
+    # Apply OOM threshold
+    vram_ok = estimated_vram_gb < (available_vram_gb * OOM_THRESHOLD)
+    ram_ok = estimated_ram_gb < (available_ram_gb * OOM_THRESHOLD)
+    
+    # Generate warnings
+    if not vram_ok:
+        warnings.append(
+            f"⚠️ VRAM may be insufficient: need ~{estimated_vram_gb:.1f}GB, "
+            f"available {available_vram_gb:.1f}GB/{total_vram_gb:.1f}GB"
+        )
+    
+    if not ram_ok:
+        warnings.append(
+            f"⚠️ System RAM may be insufficient for output phase: need ~{estimated_ram_gb:.1f}GB, "
+            f"available {available_ram_gb:.1f}GB/{total_ram_gb:.1f}GB"
+        )
+    
+    return {
+        "vram_ok": vram_ok,
+        "ram_ok": ram_ok,
+        "available_vram_gb": available_vram_gb,
+        "available_ram_gb": available_ram_gb,
+        "total_vram_gb": total_vram_gb,
+        "total_ram_gb": total_ram_gb,
+        "vram_headroom_gb": vram_headroom_gb,
+        "ram_headroom_gb": ram_headroom_gb,
+        "warnings": warnings
+    }
+
+
+def get_optimal_settings(width, height, frames, scale, available_vram_gb, available_ram_gb, current_mode="tiny"):
+    """
+    Recommend optimal settings based on available resources.
+    
+    Provides recommendations for tiling and chunking when resources are limited.
+    Based on ComfyUI-FlashVSR_Stable frame chunking recommendations:
+    - 8GB VRAM → 20 frames
+    - 12GB VRAM → 50 frames  
+    - 16GB VRAM → 100 frames
+    - 24GB+ VRAM → all frames
+    
+    Args:
+        width: Input video width
+        height: Input video height
+        frames: Number of frames
+        scale: Scale factor
+        available_vram_gb: Available VRAM in GB
+        available_ram_gb: Available system RAM in GB
+        current_mode: Current pipeline variant
+        
+    Returns:
+        dict with:
+            - recommended_tiled_vae: Boolean
+            - recommended_tiled_dit: Boolean
+            - recommended_mode: String pipeline variant
+            - recommended_tile_size: Int tile size if tiling recommended
+            - recommendations: List of recommendation strings
+    """
+    recommendations = []
+    
+    # Start with current settings
+    recommended_tiled_vae = False
+    recommended_tiled_dit = False
+    recommended_mode = current_mode
+    recommended_tile_size = 256
+    
+    # Calculate output size
+    out_width = width * scale
+    out_height = height * scale
+    out_pixels = out_width * out_height
+    
+    # VRAM-based recommendations
+    if available_vram_gb < 8:
+        recommendations.append("🔴 Less than 8GB VRAM - FlashVSR may not run. Consider using a smaller scale factor.")
+        recommended_tiled_vae = True
+        recommended_tiled_dit = True
+        recommended_tile_size = 128
+    elif available_vram_gb < 10:
+        recommendations.append("🟡 8-10GB VRAM detected. Recommend: Enable Tiled DiT, use Tiny mode.")
+        recommended_tiled_vae = True
+        recommended_tiled_dit = True
+        recommended_mode = "tiny"
+    elif available_vram_gb < 12:
+        recommendations.append("🟢 10-12GB VRAM detected. Recommend: Enable Tiled VAE, use Tiny or Tiny-Long mode.")
+        recommended_tiled_vae = True
+        recommended_mode = "tiny" if frames < 120 else "tiny-long"
+    elif available_vram_gb < 16:
+        recommendations.append("🟢 12-16GB VRAM detected. Should handle most videos with Tiled VAE enabled.")
+        recommended_tiled_vae = True
+    elif available_vram_gb < 24:
+        recommendations.append("🟢 16-24GB VRAM detected. Can handle large videos, Full mode available.")
+    else:
+        recommendations.append("🟢 24GB+ VRAM detected. Full mode with all optimizations available.")
+    
+    # Output RAM recommendations for large videos
+    estimated_output_ram = (frames * out_height * out_width * 3 * 6) / (1024**3)  # ~6 bytes per pixel (fp32 + overhead)
+    
+    if estimated_output_ram > available_ram_gb * 0.8:
+        recommendations.append(
+            f"🟡 Output phase may use ~{estimated_output_ram:.1f}GB RAM. "
+            f"Recommend: Use Tiny-Long mode for streaming output."
+        )
+        recommended_mode = "tiny-long"
+    
+    # Large resolution recommendations
+    if out_pixels > 3840 * 2160:  # Larger than 4K
+        recommendations.append("🟡 Output resolution exceeds 4K. Recommend: Enable Tiled DiT for stability.")
+        recommended_tiled_dit = True
+    
+    # High frame count without tiling - computational complexity warning
+    # DiT attention is O(n²) across frames, so >100 frames without tiling is very slow
+    if frames > 100 and not recommended_tiled_dit:
+        recommendations.append(
+            f"🟡 High frame count ({frames} frames) without Tiled DiT will be very slow. "
+            f"DiT attention is O(n²) across frames. Recommend: Enable Tiled DiT."
+        )
+        recommended_tiled_dit = True
+    
+    # Long video recommendations
+    if frames > 200:
+        recommendations.append(f"🟡 Long video ({frames} frames). Recommend: Use Tiny-Long mode for memory efficiency.")
+        recommended_mode = "tiny-long"
+    
+    return {
+        "recommended_tiled_vae": recommended_tiled_vae,
+        "recommended_tiled_dit": recommended_tiled_dit,
+        "recommended_mode": recommended_mode,
+        "recommended_tile_size": recommended_tile_size,
+        "recommendations": recommendations
+    }
+
+
+def log_processing_summary(start_time, width, height, frames, scale, mode, tiled_vae, tiled_dit):
+    """
+    Log processing summary on completion with peak VRAM usage.
+    
+    Args:
+        start_time: Processing start time (from time.time())
+        width: Input width
+        height: Input height
+        frames: Number of frames
+        scale: Scale factor used
+        mode: Pipeline variant used
+        tiled_vae: Whether tiled VAE was used
+        tiled_dit: Whether tiled DiT was used
+    """
+    import time
+    
+    elapsed = time.time() - start_time
+    
+    # Get peak VRAM usage
+    peak_vram_gb = 0.0
+    if torch.cuda.is_available():
+        try:
+            peak_vram_bytes = torch.cuda.max_memory_reserved()
+            peak_vram_gb = peak_vram_bytes / (1024**3)
+        except Exception:
+            pass
+    
+    # Calculate throughput
+    fps_throughput = frames / elapsed if elapsed > 0 else 0
+    
+    out_width = width * scale
+    out_height = height * scale
+    
+    summary = (
+        f"\n{'='*60}\n"
+        f"[FlashVSR] Processing Summary\n"
+        f"{'='*60}\n"
+        f"Input:  {width}x{height} @ {frames} frames\n"
+        f"Output: {out_width}x{out_height} @ {frames} frames\n"
+        f"Mode:   {mode.upper()} | Scale: {scale}x\n"
+        f"Tiling: VAE={'Yes' if tiled_vae else 'No'}, DiT={'Yes' if tiled_dit else 'No'}\n"
+        f"{'='*60}\n"
+        f"Time:       {elapsed:.1f}s ({fps_throughput:.2f} frames/sec)\n"
+        f"Peak VRAM:  {peak_vram_gb:.2f} GB\n"
+        f"{'='*60}\n"
+    )
+    
+    print(summary)
+    
+    return {
+        "elapsed_seconds": elapsed,
+        "peak_vram_gb": peak_vram_gb,
+        "fps_throughput": fps_throughput
+    }
+
+
+def reset_peak_vram_stats():
+    """Reset CUDA peak memory statistics for accurate tracking."""
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
+
+
 def tensor_upscale_then_center_crop(frame_slice, scale, tW, tH):
     """
     Upscale a frame tensor using bicubic interpolation, then center crop.
@@ -271,6 +616,249 @@ def input_tensor_generator(image_tensor, device, scale=4, dtype=torch.bfloat16):
         tensor_out = tensor_chw * 2.0 - 1.0
         del tensor_chw
         yield tensor_out.to('cpu').to(dtype)
+
+
+# =============================================================================
+# MEMORY-EFFICIENT VIDEO OUTPUT FUNCTIONS
+# =============================================================================
+
+# Enable memory debug logging via environment variable or config
+MEMORY_DEBUG = False
+
+
+def set_memory_debug(enabled: bool):
+    """Enable or disable memory debug logging."""
+    global MEMORY_DEBUG
+    MEMORY_DEBUG = enabled
+
+
+def log_memory_usage(context: str = ""):
+    """
+    Log current memory usage if MEMORY_DEBUG is enabled.
+    
+    Args:
+        context: Description of what's happening when this is called
+    """
+    if not MEMORY_DEBUG:
+        return
+    
+    import psutil
+    
+    # System RAM
+    mem = psutil.virtual_memory()
+    ram_used_gb = (mem.total - mem.available) / (1024**3)
+    ram_total_gb = mem.total / (1024**3)
+    
+    # VRAM
+    vram_used_gb = 0.0
+    vram_total_gb = 0.0
+    if torch.cuda.is_available():
+        try:
+            vram_used_gb = torch.cuda.memory_allocated() / (1024**3)
+            vram_total_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        except Exception:
+            pass
+    
+    print(f"[FlashVSR Memory] {context}: RAM={ram_used_gb:.2f}/{ram_total_gb:.2f}GB, VRAM={vram_used_gb:.2f}/{vram_total_gb:.2f}GB")
+
+
+def calculate_safe_batch_size(frame_height: int, frame_width: int, available_ram_bytes: int, safety_margin_gb: float = 2.0) -> int:
+    """
+    Calculate safe batch size for video output based on available system RAM.
+    
+    Estimates memory needed per frame (tensor + numpy copy) and calculates
+    how many frames can be safely processed at once.
+    
+    Args:
+        frame_height: Height of each frame in pixels
+        frame_width: Width of each frame in pixels
+        available_ram_bytes: Available system RAM in bytes
+        safety_margin_gb: RAM to keep free (default 2GB)
+        
+    Returns:
+        Safe batch size (minimum 1, maximum 40)
+    """
+    # Per-frame memory estimation:
+    # - float32 tensor: H * W * 3 * 4 bytes
+    # - uint8 numpy copy: H * W * 3 * 1 byte
+    # Total: H * W * 3 * 5 bytes per frame, with 2x safety factor
+    bytes_per_frame = frame_height * frame_width * 3 * 5 * 2  # 2x for safety
+    
+    # Subtract safety margin
+    safety_bytes = int(safety_margin_gb * 1024**3)
+    usable_ram = max(0, available_ram_bytes - safety_bytes)
+    
+    # Calculate batch size with bounds
+    if bytes_per_frame <= 0:
+        return 40  # Fallback for edge cases
+    
+    batch_size = usable_ram // bytes_per_frame
+    batch_size = max(1, min(40, batch_size))
+    
+    log_memory_usage(f"Calculated batch size: {batch_size} frames (frame size: {frame_height}x{frame_width})")
+    
+    return batch_size
+
+
+def streaming_frame_writer(output_path: str, fps: int, quality: int):
+    """
+    Create a context manager for streaming frame output.
+    
+    Returns a writer object that can append frames one at a time,
+    avoiding the need to hold all frames in memory.
+    
+    Args:
+        output_path: Path to output video file
+        fps: Frames per second
+        quality: Video quality (1-10)
+        
+    Returns:
+        imageio writer object (use as context manager or call close() when done)
+    """
+    import imageio
+    return imageio.get_writer(output_path, fps=fps, quality=quality)
+
+
+def write_frames_streaming(output_frames_tensor, output_path: str, fps: int, quality: int, progress_callback=None):
+    """
+    Write video frames to file using streaming to minimize memory usage.
+    
+    Instead of converting all frames to numpy at once (which causes massive
+    RAM spikes), this function converts and writes frames in small batches.
+    
+    Args:
+        output_frames_tensor: Tensor of shape (F, H, W, C) in [0, 1] range
+        output_path: Path to output video file
+        fps: Frames per second
+        quality: Video quality (1-10)
+        progress_callback: Optional callback(current, total) for progress updates
+        
+    Returns:
+        Tuple of (output_height, output_width) from written frames
+    """
+    import imageio
+    import psutil
+    from tqdm import tqdm as tqdm_save
+    
+    log_memory_usage("Starting streaming write")
+    
+    # Get frame dimensions
+    num_frames = output_frames_tensor.shape[0]
+    frame_height = output_frames_tensor.shape[1]
+    frame_width = output_frames_tensor.shape[2]
+    
+    # Calculate safe batch size based on available RAM
+    available_ram = psutil.virtual_memory().available
+    batch_size = calculate_safe_batch_size(frame_height, frame_width, available_ram)
+    
+    print(f"[FlashVSR] Writing {num_frames} frames with batch size {batch_size}")
+    
+    # Open writer
+    writer = imageio.get_writer(output_path, fps=fps, quality=quality)
+    
+    try:
+        for batch_start in tqdm_save(range(0, num_frames, batch_size), desc="[FlashVSR] Saving video"):
+            batch_end = min(batch_start + batch_size, num_frames)
+            
+            log_memory_usage(f"Processing batch {batch_start}-{batch_end}")
+            
+            # Extract batch from tensor
+            batch_tensor = output_frames_tensor[batch_start:batch_end]
+            
+            # Convert batch to numpy (this is where memory spike happens, but now bounded)
+            batch_np = (batch_tensor.cpu().float() * 255.0).clip(0, 255).numpy().astype(np.uint8)
+            
+            # Write each frame in batch
+            for frame_np in batch_np:
+                writer.append_data(frame_np)
+            
+            # Immediately free batch memory
+            del batch_tensor, batch_np
+            
+            # Progress callback
+            if progress_callback:
+                progress_callback(batch_end, num_frames)
+            
+            log_memory_usage(f"Completed batch {batch_start}-{batch_end}")
+    
+    finally:
+        writer.close()
+        log_memory_usage("Streaming write complete")
+    
+    return frame_height, frame_width
+
+
+def write_canvas_streaming(canvas_tensor, weight_tensor, output_path: str, fps: int, quality: int, frame_count: int):
+    """
+    Normalize canvas by weights and write frames using streaming output.
+    
+    For tiled processing, the canvas and weights are accumulated during tile
+    processing. This function normalizes and writes frames in batches to
+    avoid memory spikes from holding all normalized frames at once.
+    
+    Args:
+        canvas_tensor: Accumulated weighted canvas (F, H, W, C)
+        weight_tensor: Accumulated weights (F, H, W, C)
+        output_path: Path to output video file
+        fps: Frames per second
+        quality: Video quality (1-10)
+        frame_count: Number of original frames (before padding)
+        
+    Returns:
+        Tuple of (output_height, output_width) from written frames
+    """
+    import imageio
+    import psutil
+    from tqdm import tqdm as tqdm_save
+    
+    log_memory_usage("Starting canvas streaming write")
+    
+    # Get dimensions
+    num_frames = min(canvas_tensor.shape[0], frame_count)
+    frame_height = canvas_tensor.shape[1]
+    frame_width = canvas_tensor.shape[2]
+    
+    # Calculate safe batch size
+    available_ram = psutil.virtual_memory().available
+    batch_size = calculate_safe_batch_size(frame_height, frame_width, available_ram)
+    
+    print(f"[FlashVSR] Writing {num_frames} frames from canvas with batch size {batch_size}")
+    
+    writer = imageio.get_writer(output_path, fps=fps, quality=quality)
+    
+    try:
+        for batch_start in tqdm_save(range(0, num_frames, batch_size), desc="[FlashVSR] Saving video"):
+            batch_end = min(batch_start + batch_size, num_frames)
+            
+            log_memory_usage(f"Processing canvas batch {batch_start}-{batch_end}")
+            
+            # Extract batch from canvas and weights
+            canvas_batch = canvas_tensor[batch_start:batch_end]
+            weight_batch = weight_tensor[batch_start:batch_end].clone()
+            
+            # Avoid division by zero
+            weight_batch[weight_batch == 0] = 1.0
+            
+            # Normalize batch
+            normalized_batch = canvas_batch / weight_batch
+            
+            # Convert to numpy
+            batch_np = (normalized_batch.cpu().float() * 255.0).clip(0, 255).numpy().astype(np.uint8)
+            
+            # Write frames
+            for frame_np in batch_np:
+                writer.append_data(frame_np)
+            
+            # Free batch memory immediately
+            del canvas_batch, weight_batch, normalized_batch, batch_np
+            
+            log_memory_usage(f"Completed canvas batch {batch_start}-{batch_end}")
+    
+    finally:
+        writer.close()
+        log_memory_usage("Canvas streaming write complete")
+    
+    return frame_height, frame_width
 
 
 def stitch_video_tiles(
@@ -447,15 +1035,24 @@ class FlashVSRPlugin(WAN2GPPlugin):
         """
         super().__init__()
         self.name = "FlashVSR Upscaling"
-        self.version = "1.0.0"
+        self.version = "1.0.1"
         self.description = "AI-powered 4x video upscaling with FlashVSR models (8GB+ VRAM)"
         
         # Plugin state
         self.current_pipeline = None
         self.models_loaded = False
         
+        # Cancellation flag for stopping long-running operations (Task 4.1)
+        self._cancel_flag = False
+        
         # Load config
         self.config = self.load_config()
+        
+        # Enable memory debug logging if configured (Task 2.5)
+        debug_config = self.config.get("debug", {})
+        if debug_config.get("memory_logging", False):
+            set_memory_debug(True)
+            print("[FlashVSR] Memory debug logging enabled")
         
     def load_config(self):
         """
@@ -494,6 +1091,9 @@ class FlashVSRPlugin(WAN2GPPlugin):
             "processing": {
                 "dtype": "bf16",
                 "unload_dit": False
+            },
+            "debug": {
+                "memory_logging": False  # Enable verbose memory logging for debugging
             }
         }
         
@@ -800,7 +1400,7 @@ class FlashVSRPlugin(WAN2GPPlugin):
                         tiled_dit = gr.Checkbox(
                             label="Tiled DiT",
                             value=defaults["tiled_dit"],
-                            info="Required for 8GB GPUs at 1080p",
+                            info="⚡ Recommended for 50+ frames (faster processing)",
                             elem_id="flashvsr_tiled_dit"
                         )
                         
@@ -914,31 +1514,33 @@ class FlashVSRPlugin(WAN2GPPlugin):
                             elem_id="flashvsr_model_version"
                         )
                     
-                    # Upscale button with progress
+                    # Upscale button with progress (Task 5.1: two-button pattern)
                     upscale_btn = gr.Button(
                         "🚀 Upscale Video",
                         variant="primary",
                         size="lg",
-                        elem_id="flashvsr_upscale_btn"
+                        elem_id="flashvsr_upscale_btn",
+                        visible=True
+                    )
+                    
+                    # Stop button (Task 4.2: visible=False by default)
+                    stop_btn = gr.Button(
+                        "⬛ Stop Processing",
+                        variant="stop",
+                        size="lg",
+                        elem_id="flashvsr_stop_btn",
+                        visible=False
                     )
                     
                     progress_bar = gr.Progress()
                 
-                # Right column - Output and status
+                # Right column - Output (Task 5.4: status_text removed)
                 with gr.Column(scale=1):
                     gr.Markdown("### Output")
                     
                     video_output = gr.Video(
                         label="Upscaled Video",
                         elem_id="flashvsr_output_video"
-                    )
-                    
-                    status_text = gr.Textbox(
-                        label="Status",
-                        value="Ready to upscale. Upload a video to begin.",
-                        interactive=False,
-                        lines=3,
-                        elem_id="flashvsr_status"
                     )
                     
                     # Info box with VRAM estimates
@@ -949,7 +1551,8 @@ class FlashVSRPlugin(WAN2GPPlugin):
                         - Tiny-Long: 10-12GB for long videos
                         - Full: 18-24GB for highest quality
                         
-                        Enable Tiled DiT for 8GB GPUs.
+                        **⚡ Tiled DiT:** Recommended for videos with 50+ frames.
+                        Without it, processing is O(n²) slow regardless of VRAM.
                         """,
                         elem_id="flashvsr_vram_info"
                     )
@@ -984,7 +1587,7 @@ class FlashVSRPlugin(WAN2GPPlugin):
                     progress: Gradio progress tracker
                 
                 Returns:
-                    Tuple of (output_video_path, status_message)
+                    str: Output video path, or None on error (Task 5.5)
                 """
                 import os
                 import torch
@@ -993,9 +1596,13 @@ class FlashVSRPlugin(WAN2GPPlugin):
                 import ffmpeg
                 from pathlib import Path
                 
+                # Reset cancellation flag at start (Task 4.3)
+                self._cancel_flag = False
+                
                 # Validation
                 if video is None:
-                    return None, "❌ Please upload a video first."
+                    gr.Warning("Please upload a video first.")
+                    return None
                 
                 try:
                     progress(0, desc="Initializing...")
@@ -1020,7 +1627,8 @@ class FlashVSRPlugin(WAN2GPPlugin):
                     device = "cuda" if torch.cuda.is_available() else "cpu"
                     
                     if device == "cpu":
-                        return None, "❌ CUDA GPU required for FlashVSR upscaling."
+                        gr.Error("CUDA GPU required for FlashVSR upscaling.")
+                        return None
                     
                     # Import helper functions from download_manager
                     from .src.models.download_manager import load_pipeline
@@ -1044,12 +1652,72 @@ class FlashVSRPlugin(WAN2GPPlugin):
                         reader.close()
                         
                         if len(frames) < 21:
-                            return None, f"❌ Video must have at least 21 frames. Got {len(frames)} frames."
+                            gr.Warning(f"Video must have at least 21 frames. Got {len(frames)} frames.")
+                            return None
                         
                         video_tensor = torch.stack(frames, 0)  # Shape: (N, H, W, C)
                         
                     except Exception as e:
-                        return None, f"❌ Error loading video: {str(e)}"
+                        gr.Error(f"Error loading video: {str(e)}")
+                        return None
+                    
+                    # =================================================================
+                    # PRE-FLIGHT RESOURCE CHECK
+                    # =================================================================
+                    progress(0.10, desc="Checking system resources...")
+                    
+                    frame_count = int(video_tensor.shape[0])
+                    N0, h0, w0, _ = video_tensor.shape
+                    
+                    # Estimate resource requirements
+                    estimates = estimate_vram_usage(
+                        width=w0,
+                        height=h0,
+                        frames=frame_count,
+                        scale=scale_factor,
+                        tiled_vae=t_vae,
+                        tiled_dit=t_dit,
+                        mode=selected_variant
+                    )
+                    
+                    # Check against available resources
+                    resources = check_resources(
+                        estimated_vram_gb=estimates["total_vram_gb"],
+                        estimated_ram_gb=estimates["output_ram_gb"]
+                    )
+                    
+                    # Log resource check results
+                    print(f"[FlashVSR] Pre-flight check: {estimates['details']}")
+                    print(f"[FlashVSR] Available: VRAM={resources['available_vram_gb']:.1f}GB, RAM={resources['available_ram_gb']:.1f}GB")
+                    
+                    # Display warnings if resources are insufficient
+                    if resources["warnings"]:
+                        # Get optimal settings recommendations
+                        optimal = get_optimal_settings(
+                            width=w0,
+                            height=h0,
+                            frames=frame_count,
+                            scale=scale_factor,
+                            available_vram_gb=resources["available_vram_gb"],
+                            available_ram_gb=resources["available_ram_gb"],
+                            current_mode=selected_variant
+                        )
+                        
+                        # Build warning message
+                        warning_parts = resources["warnings"].copy()
+                        warning_parts.extend(optimal["recommendations"])
+                        warning_msg = "\n".join(warning_parts)
+                        
+                        # Display warning to user (processing continues)
+                        gr.Warning(warning_msg)
+                        print(f"[FlashVSR] Resource warnings:\n{warning_msg}")
+                    
+                    # Reset peak VRAM stats for accurate tracking
+                    reset_peak_vram_stats()
+                    
+                    # Record start time for processing summary
+                    import time as time_module
+                    processing_start_time = time_module.time()
                     
                     progress(0.15, desc=f"Loading {selected_variant.upper()} pipeline (model: {model_ver})...")
                     
@@ -1071,14 +1739,14 @@ class FlashVSRPlugin(WAN2GPPlugin):
                         self.current_pipeline = pipeline
                         self.models_loaded = True
                     except Exception as e:
-                        return None, f"❌ Error loading pipeline: {str(e)}"
+                        gr.Error(f"Error loading pipeline: {str(e)}")
+                        return None
                     
                     progress(0.25, desc="Preparing input frames...")
                     
                     # Prepare input tensor - matches upstream FlashVSR_plus approach
                     # Frame padding to ensure 8n+5 alignment for the pipeline
-                    frame_count = int(video_tensor.shape[0])
-                    N0, h0, w0, _ = video_tensor.shape
+                    # Note: frame_count, N0, h0, w0 already defined in pre-flight check
 
                     pad_to = next_8n5(frame_count)
                     add = pad_to - frame_count
@@ -1131,7 +1799,8 @@ class FlashVSRPlugin(WAN2GPPlugin):
                             
                             # Validate overlap
                             if t_overlap > t_size / 2:
-                                return None, "❌ Overlap must be less than half of the tile size!"
+                                gr.Warning("Overlap must be less than half of the tile size!")
+                                return None
                             
                             # Calculate tile coordinates at ORIGINAL resolution
                             tile_coords = calculate_tile_coords(H, W, t_size, t_overlap)
@@ -1156,6 +1825,18 @@ class FlashVSRPlugin(WAN2GPPlugin):
                                 temp_videos = []
                                 
                                 for tile_idx, (x1, y1, x2, y2) in enumerate(tqdm_progress(tile_coords, desc="[FlashVSR] Processing tiles")):
+                                    # Task 4.4: Check for cancellation at start of each tile
+                                    if self._cancel_flag:
+                                        # Task 4.5: Cleanup on cancellation - delete temp files
+                                        import shutil
+                                        try:
+                                            shutil.rmtree(temp_dir)
+                                        except:
+                                            pass
+                                        # Task 4.6: Show cancellation warning
+                                        gr.Warning("Upscaling cancelled by user. Partial files deleted.")
+                                        return None
+                                    
                                     progress(
                                         0.35 + 0.40 * (tile_idx / num_tiles),
                                         desc=f"Processing tile {tile_idx+1}/{num_tiles}"
@@ -1233,6 +1914,15 @@ class FlashVSRPlugin(WAN2GPPlugin):
                                 weight_sum_canvas = torch.zeros_like(final_output_canvas)
                                 
                                 for tile_idx, (x1, y1, x2, y2) in enumerate(tqdm_progress(tile_coords, desc="[FlashVSR] Processing tiles")):
+                                    # Task 4.4: Check for cancellation at start of each tile
+                                    if self._cancel_flag:
+                                        # Task 4.5: Cleanup on cancellation - delete canvas tensors
+                                        del final_output_canvas, weight_sum_canvas
+                                        clean_vram()
+                                        # Task 4.6: Show cancellation warning
+                                        gr.Warning("Upscaling cancelled by user.")
+                                        return None
+                                    
                                     progress(
                                         0.35 + 0.50 * (tile_idx / num_tiles),
                                         desc=f"Processing tile {tile_idx+1}/{num_tiles}"
@@ -1293,12 +1983,27 @@ class FlashVSRPlugin(WAN2GPPlugin):
                                     del LQ_tile, output_tile_gpu, processed_tile_cpu, input_tile, mask
                                     clean_vram()
                                 
-                                # Normalize by weight sum
-                                weight_sum_canvas[weight_sum_canvas == 0] = 1.0
-                                final_output_tensor = final_output_canvas / weight_sum_canvas
+                                # Use streaming write for tiled canvas output (Task 2.3)
+                                # This avoids the memory spike from normalizing all frames at once
+                                progress(0.85, desc="Saving output video (streaming)...")
                                 
-                                # Trim to original frame count (before padding)
-                                output_frames = final_output_tensor[:frame_count]
+                                log_memory_usage("Before canvas streaming write")
+                                
+                                out_h, out_w = write_canvas_streaming(
+                                    canvas_tensor=final_output_canvas,
+                                    weight_tensor=weight_sum_canvas,
+                                    output_path=str(output_path),
+                                    fps=fps,
+                                    quality=int(out_quality),
+                                    frame_count=frame_count
+                                )
+                                
+                                # Delete intermediate tensors immediately (Task 2.4)
+                                del final_output_canvas, weight_sum_canvas
+                                clean_vram()
+                                log_memory_usage("After canvas streaming write")
+                                
+                                output_written_directly = True
                                 
                                 print("[FlashVSR] Tile-DiT processing complete.")
                             
@@ -1322,6 +2027,12 @@ class FlashVSRPlugin(WAN2GPPlugin):
                                 "color_fix": c_fix,
                                 "unload_dit": do_unload_dit,
                             }
+                            
+                            # Task 4.4: Check for cancellation before starting pipeline
+                            if self._cancel_flag:
+                                clean_vram()
+                                gr.Warning("Upscaling cancelled by user.")
+                                return None
                             
                             if is_tiny_long:
                                 # ============================================================
@@ -1384,25 +2095,28 @@ class FlashVSRPlugin(WAN2GPPlugin):
                         import traceback
                         error_trace = traceback.format_exc()
                         print(f"[FlashVSR] Error during upscaling: {error_trace}")
-                        return None, f"❌ Error during upscaling: {str(e)}"
+                        gr.Error(f"Error during upscaling: {str(e)}")
+                        return None
                     
                     progress(0.85, desc="Saving output video...")
                     
-                    # Save video (skip if Tiny-Long already wrote directly)
+                    # Save video (skip if already written directly)
                     if not output_written_directly:
                         # output_frames is in (F, H, W, C) format in [0, 1] range
-                        # Get output dimensions for status message
-                        out_h, out_w = output_frames.shape[1], output_frames.shape[2]
+                        # Use streaming write to avoid memory spike (Task 2.2)
+                        log_memory_usage("Before streaming write")
                         
-                        # Write frames to video with user-specified quality
-                        frames_np = (output_frames.cpu().float() * 255.0).clip(0, 255).numpy().astype(np.uint8)
-                        writer = imageio.get_writer(str(output_path), fps=fps, quality=int(out_quality))
+                        out_h, out_w = write_frames_streaming(
+                            output_frames_tensor=output_frames,
+                            output_path=str(output_path),
+                            fps=fps,
+                            quality=int(out_quality)
+                        )
                         
-                        from tqdm import tqdm as tqdm_save
-                        for frame_np in tqdm_save(frames_np, desc="[FlashVSR] Saving video"):
-                            writer.append_data(frame_np)
-                        
-                        writer.close()
+                        # Delete intermediate tensors immediately (Task 2.4)
+                        del output_frames
+                        clean_vram()
+                        log_memory_usage("After streaming write")
                     
                     # Get output dimensions from file for status message
                     try:
@@ -1412,6 +2126,17 @@ class FlashVSRPlugin(WAN2GPPlugin):
                         out_h = int(video_stream['height'])
                     except:
                         out_w, out_h = 0, 0  # Fallback if probe fails
+                    
+                    # Task 4.4: Check for cancellation before audio merge
+                    if self._cancel_flag:
+                        # Task 4.5: Delete partial output file
+                        try:
+                            if output_path.exists():
+                                os.remove(str(output_path))
+                        except:
+                            pass
+                        gr.Warning("Upscaling cancelled by user. Partial files deleted.")
+                        return None
                     
                     progress(0.95, desc="Merging audio...")
                     
@@ -1440,45 +2165,72 @@ class FlashVSRPlugin(WAN2GPPlugin):
                     progress(1.0, desc="Complete!")
                     
                     # Get output frame count for status
-                    if output_written_directly:
-                        # For Tiny-Long, get frame count from output file
-                        try:
-                            probe = ffmpeg.probe(str(output_path))
-                            video_stream = next(s for s in probe['streams'] if s['codec_type'] == 'video')
-                            output_frame_count = int(video_stream.get('nb_frames', frame_count))
-                        except:
-                            output_frame_count = frame_count
-                    else:
-                        output_frame_count = len(frames_np)
+                    output_frame_count = frame_count  # Default to input frame count
+                    try:
+                        probe = ffmpeg.probe(str(output_path))
+                        video_stream = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+                        output_frame_count = int(video_stream.get('nb_frames', frame_count))
+                    except:
+                        pass  # Use default frame_count
                     
-                    # Generate status message
-                    status = f"""
-                    ✅ Upscaling complete!
+                    # Log processing summary with peak VRAM usage
+                    summary_stats = log_processing_summary(
+                        start_time=processing_start_time,
+                        width=w0,
+                        height=h0,
+                        frames=frame_count,
+                        scale=scale_factor,
+                        mode=selected_variant,
+                        tiled_vae=t_vae,
+                        tiled_dit=t_dit
+                    )
                     
-                    **Configuration:**
-                    - Model: {selected_variant.upper()}
-                    - Scale: {scale}
-                    - Input: {frame_count} frames @ {w0}x{h0}
-                    - Output: {output_frame_count} frames @ {out_w}x{out_h}
-                    - FPS: {fps}
+                    # Display success message using gr.Info (Task 5.6)
+                    gr.Info(f"Upscaling complete! {frame_count} frames @ {out_w}x{out_h} in {summary_stats['elapsed_seconds']:.1f}s ({summary_stats['fps_throughput']:.2f} fps). Peak VRAM: {summary_stats['peak_vram_gb']:.2f} GB")
                     
-                    **Settings:**
-                    - Tiled VAE: {'Yes' if t_vae else 'No'}
-                    - Tiled DiT: {'Yes' if t_dit else 'No'}
-                    - Color Fix: {'Yes' if c_fix else 'No'}
-                    
-                    **Output:** {output_filename}
-                    """
-                    
-                    return str(output_path), status
+                    return str(output_path)
                     
                 except Exception as e:
                     import traceback
                     error_trace = traceback.format_exc()
-                    return None, f"❌ Error: {str(e)}\n\nTraceback:\n{error_trace}"
+                    print(f"[FlashVSR] Error: {error_trace}")
+                    gr.Error(f"Error: {str(e)}")
+                    return None
             
-            # Wire up event
+            # Task 4.3: Stop button click handler
+            def on_stop_click():
+                """Handle stop button click - sets cancellation flag"""
+                self._cancel_flag = True
+                gr.Warning(
+                    "Cancellation requested. Will stop after current operation completes. "
+                    "Note: Cannot interrupt mid-inference. If stuck, restart the application."
+                )
+                return gr.update(interactive=False, value="⏳ Stopping...")
+            
+            # Task 5.2, 5.3: Button state management wrappers
+            def show_processing_state():
+                """Show stop button, hide upscale button when processing starts"""
+                return gr.update(visible=False), gr.update(visible=True)
+            
+            def show_ready_state():
+                """Show upscale button, hide stop button when processing completes"""
+                return gr.update(visible=True), gr.update(visible=False, interactive=True, value="⬛ Stop Processing")
+            
+            # Wire up stop button (Task 4.3)
+            stop_btn.click(
+                fn=on_stop_click,
+                inputs=[],
+                outputs=[stop_btn],
+                queue=False
+            )
+            
+            # Wire up upscale button with button state management (Tasks 5.2, 5.3)
             upscale_btn.click(
+                fn=show_processing_state,
+                inputs=[],
+                outputs=[upscale_btn, stop_btn],
+                queue=False
+            ).then(
                 fn=upscale_video,
                 inputs=[
                     video_input, model_variant, scale_factor,
@@ -1487,7 +2239,12 @@ class FlashVSRPlugin(WAN2GPPlugin):
                     dtype, unload_dit, sparse_ratio, kv_ratio, local_range,
                     model_version
                 ],
-                outputs=[video_output, status_text]
+                outputs=[video_output]
+            ).then(
+                fn=show_ready_state,
+                inputs=[],
+                outputs=[upscale_btn, stop_btn],
+                queue=False
             )
             
             # Save config when settings change

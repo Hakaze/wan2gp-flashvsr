@@ -2,7 +2,7 @@
 
 AI-powered 4x video upscaling using FlashVSR models with Sparse SageAttention.
 
-**Version**: 1.0.0  
+**Version**: 1.0.1  
 **License**: Apache 2.0  
 **Minimum VRAM**: 8GB
 
@@ -32,6 +32,9 @@ AI-powered 4x video upscaling using FlashVSR models with Sparse SageAttention.
   - **Tiny**: 8-10GB VRAM, fastest processing (recommended for most users)
   - **Tiny-Long**: 10-12GB VRAM, optimized for videos >120 frames
   - **Full**: 18-24GB VRAM, highest quality output
+- **Pre-Flight Resource Check** - Estimates VRAM/RAM requirements before processing with recommendations
+- **Cancellation Support** - Stop button to cancel long-running operations
+- **Memory-Efficient Output** - Streaming frame writer prevents RAM exhaustion on large videos
 - **Sparse SageAttention** - Triton-based attention requiring no CUDA compilation
 - **Automatic Model Downloads** - Models downloaded from HuggingFace on first run
 - **VAE Sharing** - Reuses Wan2GP's existing VAE checkpoint to save disk space
@@ -124,8 +127,11 @@ huggingface-cli download JunhaoZhuang/FlashVSR --local-dir ckpts/flashvsr/
 3. **Choose Settings**:
    - Select model variant (Tiny recommended)
    - Choose scale factor (4x recommended)
+   - Enable Tiled DiT for videos with 50+ frames
 4. **Click Upscale**: Press "🚀 Upscale Video" button
 5. **Wait for Processing**: Progress bar shows current status
+   - A "⬛ Stop Processing" button appears during upscaling
+   - Click it to cancel (stops after current operation)
 6. **Download Result**: Upscaled video appears in output panel
 
 ### Input Requirements
@@ -189,11 +195,13 @@ Choose the pipeline that matches your GPU and use case:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | **Tiled VAE** | ✅ On | Tiles VAE processing for large resolutions |
-| **Tiled DiT** | ❌ Off | Tiles DiT processing; required for 8GB at 1080p |
+| **Tiled DiT** | ❌ Off | Tiles DiT processing; **recommended for 50+ frames** |
 | **Tile Size** | 256 | Smaller = less VRAM, slower (128-512) |
 | **Tile Overlap** | 24px | Reduces seam artifacts at tile boundaries |
 
 **For 8GB GPUs**: Enable both Tiled VAE and Tiled DiT with tile size 256.
+
+**For 50+ frame videos**: Enable Tiled DiT regardless of VRAM. Without it, DiT attention is O(n²) across all frames, causing very slow processing even on high-end GPUs.
 
 ### Quality Settings
 
@@ -325,7 +333,9 @@ For comprehensive troubleshooting, see **[TROUBLESHOOTING.md](TROUBLESHOOTING.md
 |-------|-----------|
 | "Not enough frames" | Use video with 21+ frames, or loop short videos |
 | Out of Memory (OOM) | Enable **Tiled DiT**, reduce **Tile Size** to 128-192 |
+| Very slow processing | Enable **Tiled DiT** for videos with 50+ frames |
 | Slow first run | Wait for model download (~3GB), one-time only |
+| Cancellation not working | Cannot interrupt mid-inference; restart app if stuck |
 | Triton errors | `pip install triton>=2.0.0 --force-reinstall` |
 | Pixelated output | Increase **Sparse Ratio** to 3.0+, increase **Tile Size** |
 | Color issues | Enable **Color Fix**, try **FlashVSR-v1.1** model |
