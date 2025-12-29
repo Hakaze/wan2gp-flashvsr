@@ -716,7 +716,46 @@ def streaming_frame_writer(output_path: str, fps: int, quality: int):
         imageio writer object (use as context manager or call close() when done)
     """
     import imageio
-    return imageio.get_writer(output_path, fps=fps, quality=quality)
+
+    def _clamp_quality(q: int) -> int:
+        try:
+            q_int = int(q)
+        except Exception:
+            q_int = 5
+        return max(1, min(10, q_int))
+
+    def _quality_to_crf(q: int) -> int:
+        # Map UI quality 1..10 (low..high) to CRF 35..17 (high..low)
+        # Lower CRF = higher quality.
+        q = _clamp_quality(q)
+        crf_low_quality = 35
+        crf_high_quality = 17
+        if q == 1:
+            return crf_low_quality
+        if q == 10:
+            return crf_high_quality
+        return int(round(crf_low_quality - (q - 1) * (crf_low_quality - crf_high_quality) / 9))
+
+    # Use explicit encoding settings for player compatibility and to avoid
+    # edge-cases where imageio's `quality=` maps to parameters some ffmpeg
+    # builds/codecs handle poorly (observed: quality=10 producing audio-only output).
+    try:
+        crf = _quality_to_crf(quality)
+        return imageio.get_writer(
+            output_path,
+            fps=fps,
+            codec="libx264",
+            ffmpeg_params=[
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-crf",
+                str(crf),
+            ],
+        )
+    except Exception:
+        return imageio.get_writer(output_path, fps=fps, quality=_clamp_quality(quality))
 
 
 def write_frames_streaming(output_frames_tensor, output_path: str, fps: int, quality: int, progress_callback=None):
@@ -753,8 +792,8 @@ def write_frames_streaming(output_frames_tensor, output_path: str, fps: int, qua
     
     print(f"[FlashVSR] Writing {num_frames} frames with batch size {batch_size}")
     
-    # Open writer
-    writer = imageio.get_writer(output_path, fps=fps, quality=quality)
+    # Open writer (use the same settings as streaming_frame_writer)
+    writer = streaming_frame_writer(output_path=output_path, fps=fps, quality=quality)
     
     try:
         for batch_start in tqdm_save(range(0, num_frames, batch_size), desc="[FlashVSR] Saving video"):
@@ -824,7 +863,7 @@ def write_canvas_streaming(canvas_tensor, weight_tensor, output_path: str, fps: 
     
     print(f"[FlashVSR] Writing {num_frames} frames from canvas with batch size {batch_size}")
     
-    writer = imageio.get_writer(output_path, fps=fps, quality=quality)
+    writer = streaming_frame_writer(output_path=output_path, fps=fps, quality=quality)
     
     try:
         for batch_start in tqdm_save(range(0, num_frames, batch_size), desc="[FlashVSR] Saving video"):
@@ -912,7 +951,7 @@ def stitch_video_tiles(
             readers = [imageio.get_reader(p) for p in tile_paths]
         
         # Open output writer
-        with imageio.get_writer(output_path, fps=fps, quality=quality) as writer:
+        with streaming_frame_writer(output_path=output_path, fps=fps, quality=quality) as writer:
             
             # Process in chunks for memory efficiency
             for start_frame in tqdm(range(0, num_frames, chunk_size), desc="[FlashVSR] Stitching Chunks"):
@@ -1035,7 +1074,7 @@ class FlashVSRPlugin(WAN2GPPlugin):
         """
         super().__init__()
         self.name = "FlashVSR Upscaling"
-        self.version = "1.0.1"
+        self.version = "1.0.2"
         self.description = "AI-powered 4x video upscaling with FlashVSR models (8GB+ VRAM)"
         
         # Plugin state
@@ -1351,6 +1390,7 @@ class FlashVSRPlugin(WAN2GPPlugin):
             - Support for 8GB+ VRAM GPUs
             - Automatic model downloading from HuggingFace
             - Tile-based processing for low VRAM scenarios
+            - Automatically remuxes audio from original video (if present)
             """)
             
             with gr.Row():

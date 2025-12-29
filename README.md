@@ -344,7 +344,7 @@ For comprehensive troubleshooting, see **[TROUBLESHOOTING.md](TROUBLESHOOTING.md
 ### Getting Help
 
 1. Check [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for detailed solutions
-2. Review the [Wan2GP Issues](https://github.com/Wan-Video/Wan2.1/issues) page
+2. Review the [Wan2GP FlashVSR Issues](https://github.com/Hakaze/wan2gp-flashvsr/issues) page
 3. Enable verbose logging: `python wgp.py --verbose 2`
 
 ---
@@ -362,12 +362,12 @@ For comprehensive troubleshooting, see **[TROUBLESHOOTING.md](TROUBLESHOOTING.md
 
 ### Open-Source Projects & Libraries 
 
-* **FlashVSR** — [https://github.com/OpenImagingLab/FlashVSR](https://github.com/OpenImagingLab/FlashVSR)
+- **FlashVSR**: [OpenImagingLab/FlashVSR](https://github.com/OpenImagingLab/FlashVSR)
 - **Sparse SageAttention**: [jt-zhang/Sparse_SageAttention_API](https://github.com/jt-zhang/Sparse_SageAttention_API)
 - **SageAttention Team**: Apache 2.0 licensed attention kernels
-- **taehv** — [https://github.com/madebyollin/taehv](https://github.com/madebyollin/taehv)
-- **DiffSynth Studio**: Model management and pipeline abstractions
-- **Wan2GP**: Plugin system and video generation platform
+- **taehv**: [madebyollin/taehv](https://github.com/madebyollin/taehv)
+- **DiffSynth Studio**: [modelscope/DIffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio) - Model management and pipeline abstractions
+- **Wan2GP**: [deepbeepmeep/Wan2GP](https://github.com/deepbeepmeep/Wan2GP) - Plugin system and video generation platform
 
 ### 📜 Citation
 

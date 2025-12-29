@@ -5,6 +5,17 @@ All notable changes to the FlashVSR Plugin for Wan2GP will be documented in this
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2025-12-29
+
+### Fixed
+
+- **Output Video Quality = 10 produced audio-only files** - Updated MP4 encoding to use explicit H.264 settings (libx264 + yuv420p) and a stable quality→CRF mapping for reliable video streams.
+
+### Housekeeping
+- Fixed some incorrect links and formatting issues in `README` and `TROUBLESHOOTING`.
+
+[1.0.2]: https://github.com/Hakaze/wan2gp-flashvsr/releases/tag/v1.0.2
+
 ## [1.0.1] - 2025-12-23
 
 ### Added
@@ -38,6 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Memory Exhaustion on 4x Upscale** - 100+ frame 4K videos no longer cause system lockups
 - **No Way to Cancel** - Users can now stop processing (between operations)
+
+[1.0.1]: https://github.com/Hakaze/wan2gp-flashvsr/releases/tag/v1.0.1
 
 ## [1.0.0] - 2025-12-23
 

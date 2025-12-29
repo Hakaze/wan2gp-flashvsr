@@ -573,9 +573,10 @@ print(f"Tile {tile_idx} completed in {elapsed:.2f}s")
 
 ### Where to Get Help
 
-1. **Wan2GP GitHub Issues**: [Wan-Video/Wan2.1/issues](https://github.com/Wan-Video/Wan2.1/issues)
-2. **FlashVSR_plus Reference**: [lihaoyun6/FlashVSR_plus](https://github.com/lihaoyun6/FlashVSR_plus)
-3. **FlashVSR Paper**: [arXiv:2510.12747](https://arxiv.org/abs/2510.12747)
+1. **wan2gp-flashvsr Github Issues**: [Hakaze/wan2gp-flashvsr/issues](https://github.com/Hakaze/wan2gp-flashvsr/issues)
+2. **Wan2GP GitHub Issues**: [deepbeepmeep/Wan2GP/issues](https://github.com/deepbeepmeep/Wan2GP/issues)
+3. **FlashVSR_plus Reference**: [lihaoyun6/FlashVSR_plus](https://github.com/lihaoyun6/FlashVSR_plus)
+4. **FlashVSR Paper**: [arXiv:2510.12747](https://arxiv.org/abs/2510.12747)
 
 ### Reporting Bugs
 
