@@ -2,7 +2,7 @@
 
 AI-powered 4x video upscaling using FlashVSR models with Sparse SageAttention.
 
-**Version**: 1.0.1  
+**Version**: 1.0.2  
 **License**: Apache 2.0  
 **Minimum VRAM**: 8GB
 
