@@ -5,8 +5,7 @@ Handles automatic model downloads from HuggingFace and local caching.
 
 import os
 import torch
-import torch.nn as nn
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 from pathlib import Path
 
 
@@ -48,8 +47,9 @@ def ensure_models_downloaded(model_version: str = "FlashVSR-v1.1", force_downloa
     if model_dir.exists() and not force_download:
         # Basic validation - check for key files
         required_files = [
-            "dit.safetensors",
-            "config.json"
+            "diffusion_pytorch_model_streaming_dmd.safetensors",
+            "LQ_proj_in.ckpt",
+            "TCDecoder.ckpt",
         ]
         
         all_exist = all((model_dir / f).exists() for f in required_files)
@@ -68,83 +68,89 @@ def ensure_models_downloaded(model_version: str = "FlashVSR-v1.1", force_downloa
     print(f"[FlashVSR] This may take several minutes depending on your internet connection.")
     
     try:
-        # Download to model version specific subdirectory for proper caching
+        # Download FlashVSR-specific models only; exclude the
+        # bundled pickle VAE since Wan2GP already ships the
+        # safetensors version (or we download it separately).
         snapshot_download(
             repo_id=model_name,
             local_dir=str(model_dir),
             local_dir_use_symlinks=False,
-            resume_download=True
+            resume_download=True,
+            ignore_patterns=["Wan2.1_VAE.pth"],
         )
         print(f"[FlashVSR] Models downloaded successfully to: {model_dir}")
     except Exception as e:
         print(f"[FlashVSR] Error downloading models: {str(e)}")
         raise RuntimeError(f"Failed to download FlashVSR models: {str(e)}")
     
+    # Notify if a stale pickle VAE from a previous download exists
+    stale_vae = model_dir / "Wan2.1_VAE.pth"
+    if stale_vae.exists():
+        print(
+            f"[FlashVSR] Note: {stale_vae} is no longer needed "
+            "and can be safely deleted to free ~1.5 GB of disk space."
+        )
+    
     return str(model_dir)
 
 
-def get_vae_path() -> Optional[str]:
+def get_vae_path() -> str:
     """
-    Get path to Wan2.1 VAE, checking both .safetensors and .pth formats.
-    
+    Get path to Wan2.1 VAE, preferring the safetensors format.
+
+    Checks local paths first, then downloads the safetensors VAE
+    from the same HuggingFace source that Wan2GP's model manager
+    uses (DeepBeepMeep/Wan2.1) when no local copy exists.
+
     Returns:
-        Path to VAE file if found, None otherwise
+        Path to a VAE file (.safetensors or .pth).
+
+    Raises:
+        RuntimeError: If the VAE cannot be found or downloaded.
     """
     ckpts_dir = get_ckpts_dir()
-    
-    # Check for .safetensors first (Wan2GP format)
+
+    # 1. Prefer existing safetensors VAE (ships with Wan2GP)
     safetensors_path = ckpts_dir / "Wan2.1_VAE.safetensors"
     if safetensors_path.exists():
-        print(f"[FlashVSR] Found Wan2.1 VAE (safetensors): {safetensors_path}")
+        print(
+            f"[FlashVSR] Found Wan2.1 VAE (safetensors): "
+            f"{safetensors_path}"
+        )
         return str(safetensors_path)
-    
-    # Check for .pth format (FlashVSR native format)
-    pth_path = ckpts_dir / "flashvsr" / "vae.pth"
+
+    # 2. Fall back to legacy .pth at the ckpts root
+    pth_path = ckpts_dir / "Wan2.1_VAE.pth"
     if pth_path.exists():
         print(f"[FlashVSR] Found Wan2.1 VAE (pth): {pth_path}")
         return str(pth_path)
-    
-    # Check alternative .pth location
-    alt_pth_path = ckpts_dir / "Wan2.1_VAE.pth"
-    if alt_pth_path.exists():
-        print(f"[FlashVSR] Found Wan2.1 VAE (pth): {alt_pth_path}")
-        return str(alt_pth_path)
-    
-    return None
 
-
-def convert_vae_safetensors_to_pth(safetensors_path: str, output_path: Optional[str] = None) -> str:
-    """
-    Convert VAE from .safetensors to .pth format for FlashVSR compatibility.
-    
-    Args:
-        safetensors_path: Path to .safetensors file
-        output_path: Optional output path (defaults to same location with .pth extension)
-        
-    Returns:
-        Path to converted .pth file
-    """
-    from safetensors.torch import load_file
-    
-    if output_path is None:
-        output_path = str(Path(safetensors_path).with_suffix('.pth'))
-    
-    print(f"[FlashVSR] Converting VAE from safetensors to pth format...")
-    print(f"[FlashVSR] Input: {safetensors_path}")
-    print(f"[FlashVSR] Output: {output_path}")
-    
+    # 3. Edge case: no local VAE at all (user hasn't loaded a
+    #    Wan 2.1/2.2 model yet).  Download the safetensors VAE
+    #    from the same repo Wan2GP's model manager uses.
+    print(
+        "[FlashVSR] Wan2.1 VAE not found locally. "
+        "Downloading from DeepBeepMeep/Wan2.1..."
+    )
     try:
-        # Load from safetensors
-        state_dict = load_file(safetensors_path)
-        
-        # Save as .pth
-        torch.save(state_dict, output_path)
-        
-        print(f"[FlashVSR] Conversion complete!")
-        return output_path
+        from huggingface_hub import hf_hub_download
+
+        hf_hub_download(
+            repo_id="DeepBeepMeep/Wan2.1",
+            filename="Wan2.1_VAE.safetensors",
+            local_dir=str(ckpts_dir),
+        )
+        print(
+            f"[FlashVSR] VAE downloaded successfully: "
+            f"{safetensors_path}"
+        )
+        return str(safetensors_path)
     except Exception as e:
-        print(f"[FlashVSR] Error converting VAE: {str(e)}")
-        raise RuntimeError(f"Failed to convert VAE format: {str(e)}")
+        raise RuntimeError(
+            "Failed to download Wan2.1 VAE from HuggingFace. "
+            f"Please place Wan2.1_VAE.safetensors in {ckpts_dir} "
+            f"manually. Error: {e}"
+        ) from e
 
 
 def get_posi_prompt_path() -> str:
@@ -200,33 +206,8 @@ def get_model_paths(variant: str = "tiny", model_version: str = "FlashVSR-v1.1")
         "posi_prompt": get_posi_prompt_path()
     }
     
-    # Get VAE path (check for existing Wan2GP VAE first)
-    vae_path = get_vae_path()
-    
-    if vae_path is None:
-        # VAE not found, will be downloaded with models
-        vae_from_download = model_dir / "vae.pth"
-        if vae_from_download.exists():
-            paths["vae"] = str(vae_from_download)
-        else:
-            raise FileNotFoundError(
-                "VAE not found. Expected either:\n"
-                f"  - ckpts/Wan2.1_VAE.safetensors (from Wan2GP)\n"
-                f"  - {vae_from_download} (from FlashVSR download)"
-            )
-    else:
-        # Check if conversion needed (.safetensors -> .pth)
-        if vae_path.endswith('.safetensors'):
-            ckpts_dir = get_ckpts_dir()
-            pth_path = ckpts_dir / "Wan2.1_VAE.pth"
-            
-            if not pth_path.exists():
-                print("[FlashVSR] VAE is in safetensors format, converting to pth...")
-                vae_path = convert_vae_safetensors_to_pth(vae_path, str(pth_path))
-            else:
-                vae_path = str(pth_path)
-        
-        paths["vae"] = vae_path
+    # Get VAE path — checks local copies first, downloads if needed
+    paths["vae"] = get_vae_path()
     
     # Variant-specific requirements
     if variant in ["tiny", "tiny-long"]:

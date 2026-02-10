@@ -5,6 +5,20 @@ All notable changes to the FlashVSR Plugin for Wan2GP will be documented in this
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] - 2026-02-09
+
+### Fixes & Optimized
+- `snapshot_download` now excludes the pickle VAE — Added `ignore_patterns=["Wan2.1_VAE.pth"]` so the ~0.5 GB redundant file is no longer downloaded from the FlashVSR HuggingFace repo.
+- **Fixed** the `required_files` validation — Was checking for "dit.safetensors" and "config.json" which don't match the actual filenames, causing unnecessary re-download attempts every launch. Now checks for the real filenames: diffusion_pytorch_model_streaming_dmd.safetensors, LQ_proj_in.ckpt, TCDecoder.ckpt.
+- Rewrote `get_vae_path()` with download fallback — Now always returns a valid path:
+  - First checks Wan2.1_VAE.safetensors (most common case)
+  - Falls back to Wan2.1_VAE.pth (legacy)
+  - Removed the dead check for ckpts/flashvsr/vae.pth (never existed)
+  - If neither found, downloads the safetensors VAE from DeepBeepMeep/Wan2.1 using hf_hub_download — the same source Wan2GP's model manager uses
+- Removed `convert_vae_safetensors_to_pth()` — The FlashVSR ModelManager → `load_state_dict()` already handles .safetensors files natively via safe_open, so the pickle conversion was unnecessary and insecure.
+- Simplified `get_model_paths()` VAE resolution — Replaced the 20-line if/else block with a single line: `paths["vae"] = get_vae_path()`.
+- Added a stale-file notice — If a previous Wan2.1_VAE.pth exists from an older download, prints a message suggesting the user can delete it to reclaim ~0.5 GB.
+
 ## [1.0.2] - 2025-12-29
 
 ### Fixed
